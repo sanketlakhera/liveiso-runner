@@ -105,7 +105,13 @@ pub struct VmConfig {
 }
 
 /// Builds the QEMU command-line arguments (excluding the program path).
-pub fn build_args(config: &VmConfig) -> Vec<OsString> {
+///
+/// Disk images are passed via `-drive` whose value is a comma-separated option
+/// string, so the path is escaped (`,` -> `,,`) and must be valid UTF-8; an
+/// explicit `format=` is always given so QEMU never probes the image format.
+/// `-cdrom <file>` takes the path as one raw argv entry (verified against
+/// QEMU 11: a comma in an ISO path is NOT parsed), so ISOs stay lossless.
+pub fn build_args(config: &VmConfig) -> Result<Vec<OsString>, String> {
     let mut args: Vec<OsString> = Vec::new();
 
     let ext = config.iso_path.extension()
@@ -119,9 +125,18 @@ pub fn build_args(config: &VmConfig) -> Vec<OsString> {
         args.push("-boot".into());
         args.push("d".into());
     } else {
-        // Raw disk image / USB image (.img, .raw, .qcow2)
+        // Raw disk image / USB image (.img, .raw, .qcow2, ...)
+        let path = config.iso_path.to_str().ok_or_else(|| {
+            format!(
+                "Disk image path is not valid UTF-8 and cannot be passed to QEMU safely: {}",
+                config.iso_path.display()
+            )
+        })?;
         args.push("-drive".into());
-        args.push(format!("file={},if=ide", config.iso_path.display()).into());
+        args.push(
+            format!("file={},format={},if=ide,media=disk", path.replace(',', ",,"), drive_format(&ext))
+                .into(),
+        );
         args.push("-boot".into());
         args.push("c".into());
     }
@@ -144,7 +159,19 @@ pub fn build_args(config: &VmConfig) -> Vec<OsString> {
         args.extend(["-net", "none"].map(OsString::from));
     }
 
-    args
+    Ok(args)
+}
+
+/// Maps a (lowercase) file extension to an explicit QEMU block format name.
+fn drive_format(ext: &str) -> &'static str {
+    match ext {
+        "qcow2" => "qcow2",
+        "vmdk" => "vmdk",
+        "vdi" => "vdi",
+        "vhd" => "vpc",
+        "vhdx" => "vhdx",
+        _ => "raw",
+    }
 }
 
 pub struct VmRunner {
@@ -188,7 +215,7 @@ impl VmRunner {
         }
 
         let mut cmd = Command::new(&config.qemu_path);
-        cmd.args(build_args(&config));
+        cmd.args(build_args(&config)?);
 
         cmd.stdout(Stdio::inherit())
            .stderr(Stdio::inherit());
@@ -319,7 +346,7 @@ mod args_tests {
     }
 
     fn accel_seq(c: &VmConfig) -> Vec<String> {
-        let args: Vec<String> = build_args(c).iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let args: Vec<String> = build_args(c).unwrap().iter().map(|a| a.to_string_lossy().into_owned()).collect();
         let mut out = Vec::new();
         for (i, a) in args.iter().enumerate() {
             if a == "-accel" {
@@ -346,13 +373,68 @@ mod args_tests {
 
     #[test]
     fn iso_uses_cdrom_and_boot_d() {
-        let args = build_args(&config("a.ISO", Accelerator::Tcg));
+        let args = build_args(&config("a.ISO", Accelerator::Tcg)).unwrap();
         assert_eq!(&args[..4], ["-cdrom", "a.ISO", "-boot", "d"].map(OsString::from));
     }
 
     #[test]
     fn img_uses_drive_and_boot_c() {
-        let args = build_args(&config("a.img", Accelerator::Tcg));
-        assert_eq!(&args[..4], ["-drive", "file=a.img,if=ide", "-boot", "c"].map(OsString::from));
+        let args = build_args(&config("a.img", Accelerator::Tcg)).unwrap();
+        assert_eq!(
+            &args[..4],
+            ["-drive", "file=a.img,format=raw,if=ide,media=disk", "-boot", "c"].map(OsString::from)
+        );
+    }
+
+    fn drive_value(path: &str) -> OsString {
+        build_args(&config(path, Accelerator::Tcg)).unwrap()[1].clone()
+    }
+
+    #[test]
+    fn drive_path_commas_are_doubled() {
+        assert_eq!(drive_value("a,b.img"), OsString::from("file=a,,b.img,format=raw,if=ide,media=disk"));
+        assert_eq!(
+            drive_value("/tmp/a,format=qcow2.img"),
+            OsString::from("file=/tmp/a,,format=qcow2.img,format=raw,if=ide,media=disk")
+        );
+    }
+
+    #[test]
+    fn drive_format_mapping() {
+        for (name, fmt) in [
+            ("a.qcow2", "qcow2"), ("a.vmdk", "vmdk"), ("a.vdi", "vdi"), ("a.vhd", "vpc"),
+            ("a.vhdx", "vhdx"), ("a.IMG", "raw"), ("a.QCOW2", "qcow2"), ("a.raw", "raw"),
+            ("a.xyz", "raw"), ("noext", "raw"),
+        ] {
+            assert_eq!(
+                drive_value(name),
+                OsString::from(format!("file={name},format={fmt},if=ide,media=disk")),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn iso_path_is_passed_verbatim_even_with_commas() {
+        let args = build_args(&config("/x/my,disk.iso", Accelerator::Tcg)).unwrap();
+        assert_eq!(&args[..4], ["-cdrom", "/x/my,disk.iso", "-boot", "d"].map(OsString::from));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_disk_path_is_error_but_iso_is_lossless() {
+        use std::os::unix::ffi::OsStringExt;
+        let bad = |name: &str| {
+            let mut v = b"/x/\xff".to_vec();
+            v.extend_from_slice(name.as_bytes());
+            let mut c = config("a.img", Accelerator::Tcg);
+            c.iso_path = PathBuf::from(OsString::from_vec(v));
+            c
+        };
+        let err = build_args(&bad(".img")).unwrap_err();
+        assert!(err.contains("UTF-8"), "{err}");
+        let iso = bad(".iso");
+        let args = build_args(&iso).unwrap();
+        assert_eq!(args[1], iso.iso_path.clone().into_os_string());
     }
 }
