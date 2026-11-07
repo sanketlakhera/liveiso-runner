@@ -4,7 +4,6 @@
 //! Windows: a verb under `HKCU\Software\Classes\.iso\shell` (no admin rights needed).
 
 use std::io;
-#[cfg(target_os = "linux")]
 use std::path::PathBuf;
 
 #[cfg(windows)]
@@ -27,6 +26,9 @@ pub enum IntegrationError {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     #[error("cannot determine the user applications folder")]
     NoAppsDir,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[error("executable path cannot be used in a desktop entry (not UTF-8 or contains control characters): {}", .0.display())]
+    UnsupportedExePath(PathBuf),
     #[cfg_attr(any(target_os = "linux", target_os = "windows"), allow(dead_code))]
     #[error("file manager integration is not supported on this OS")]
     Unsupported,
@@ -67,18 +69,22 @@ pub fn install() -> Result<(), IntegrationError> {
         let apps_dir = desktop_path.parent().ok_or(IntegrationError::NoAppsDir)?;
         std::fs::create_dir_all(apps_dir).map_err(io_context("failed to create directory"))?;
 
+        let exec = desktop_exec_quote(
+            current_exe
+                .to_str()
+                .ok_or_else(|| IntegrationError::UnsupportedExePath(current_exe.clone()))?,
+        )?;
         let content = format!(
             "[Desktop Entry]\n\
             Type=Application\n\
             Name=Test with LiveISO Runner\n\
             GenericName=LiveCD Emulator\n\
             Comment=Test bootable CD-ROM or ISO image with QEMU\n\
-            Exec=\"{}\" %f\n\
+            Exec={exec} %f\n\
             Terminal=false\n\
             MimeType=application/x-cd-image;application/x-iso9660-image;application/x-raw-disk-image;\n\
             Categories=System;Emulator;Utility;\n\
-            Icon=system-run\n",
-            current_exe.to_string_lossy()
+            Icon=system-run\n"
         );
         std::fs::write(&desktop_path, content)
             .map_err(io_context("failed to write desktop file"))?;
@@ -159,4 +165,64 @@ fn refresh_desktop_database(apps_dir: &std::path::Path) {
     let _ = std::process::Command::new("update-desktop-database")
         .arg(apps_dir)
         .output();
+}
+
+/// Quotes `path` as a single argument of a Desktop Entry `Exec` value.
+///
+/// Per the Desktop Entry Specification, inside a double-quoted argument `"`,
+/// `` ` ``, `$` and `\` must be backslash-escaped; because the general string
+/// escaping (`\\` for a backslash) is applied first, each of those backslashes
+/// is doubled in the file (a literal `\` becomes four backslashes). A literal
+/// `%` is written `%%`. Control characters cannot be represented.
+#[cfg(any(test, target_os = "linux"))]
+fn desktop_exec_quote(path: &str) -> Result<String, IntegrationError> {
+    if path.chars().any(char::is_control) {
+        return Err(IntegrationError::UnsupportedExePath(PathBuf::from(path)));
+    }
+    let mut out = String::with_capacity(path.len() + 2);
+    out.push('"');
+    for c in path.chars() {
+        match c {
+            '\\' => out.push_str("\\\\\\\\"),
+            '"' | '`' | '$' => {
+                out.push_str("\\\\");
+                out.push(c);
+            }
+            '%' => out.push_str("%%"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::desktop_exec_quote as q;
+
+    #[test]
+    fn plain_and_space() {
+        assert_eq!(q("/usr/bin/app").unwrap(), r#""/usr/bin/app""#);
+        assert_eq!(q("/my dir/app").unwrap(), r#""/my dir/app""#);
+    }
+
+    #[test]
+    fn special_characters() {
+        assert_eq!(q("/a\"b").unwrap(), r#""/a\\"b""#);
+        assert_eq!(q("/a`b").unwrap(), r#""/a\\`b""#);
+        assert_eq!(q("/a$b").unwrap(), r#""/a\\$b""#);
+        assert_eq!(q("/a\\b").unwrap(), r#""/a\\\\b""#);
+        assert_eq!(q("/a%b").unwrap(), r#""/a%%b""#);
+    }
+
+    #[test]
+    fn combination() {
+        assert_eq!(q("/x y/\"$`\\%").unwrap(), r#""/x y/\\"\\$\\`\\\\%%""#);
+    }
+
+    #[test]
+    fn control_characters_rejected() {
+        assert!(q("/a\nb").is_err());
+        assert!(q("/a\tb").is_err());
+    }
 }
