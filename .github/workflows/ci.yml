@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy-test:
+    name: clippy + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Only fontconfig needs a system -dev package. Everything else is pure
+      # Rust or loaded at runtime via dlopen (wayland-sys, xkbcommon-dl, X11),
+      # and rfd 0.15 defaults to the xdg-portal backend (ashpd/zbus, pure
+      # Rust), so GTK3 is NOT required.
+      #  - libfontconfig1-dev: yeslogic-fontconfig-sys (via slint -> parley ->
+      #    fontique) calls pkg_config::find_library("fontconfig") at build time;
+      #    it also pulls in pkg-config's freetype/expat dev dependencies.
+      #  - pkg-config: needed by that build script (preinstalled on runners,
+      #    listed to be explicit).
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libfontconfig1-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # The real-QEMU test is #[ignore]d and stays skipped.
+      - name: Test
+        run: cargo test

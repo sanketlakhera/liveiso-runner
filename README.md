@@ -1,5 +1,7 @@
 # LiveISO Runner
 
+[![CI](https://github.com/sanketlakhera/liveiso-runner/actions/workflows/ci.yml/badge.svg)](https://github.com/sanketlakhera/liveiso-runner/actions/workflows/ci.yml)
+
 A fast, cross-platform tool for testing bootable live CDs, ISOs and disk images in QEMU, without burning media or setting up a virtual machine by hand.
 
 > Inspired by **MobaLiveCD**, the classic 2008 Windows utility by Mobatek. LiveISO Runner is an independent rewrite and is not affiliated with or endorsed by Mobatek.
