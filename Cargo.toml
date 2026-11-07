@@ -1,0 +1,20 @@
+[package]
+name = "liveiso-runner"
+version = "0.1.0"
+edition = "2021"
+authors = ["Sanket <lakhera.sanket850@gmail.com>"]
+description = "Cross-platform tool to boot and test live ISOs and disk images in QEMU, inspired by MobaLiveCD"
+license = "GPL-3.0-or-later"
+readme = "README.md"
+
+[dependencies]
+slint = "1.18"
+rfd = "0.15"
+which = "7.0"
+dirs = "6.0"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+
+[build-dependencies]
+slint-build = "1.18"
