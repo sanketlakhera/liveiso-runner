@@ -1,23 +1,37 @@
-use std::ffi::OsString;
 use std::collections::VecDeque;
-use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
-use std::path::{Path, PathBuf};
+use std::ffi::OsString;
+use std::io::{self, BufRead, BufReader, Read};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, PoisonError};
 use std::time::Duration;
 use which::which;
 
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
+/// Errors from building QEMU arguments or managing the VM process.
+#[derive(Debug, thiserror::Error)]
+pub enum VmError {
+    #[error("a VM is already running")]
+    AlreadyRunning,
+    #[error("no VM is currently running")]
+    NotRunning,
+    #[error("disk image path is not valid UTF-8 and cannot be passed to QEMU safely: {}", .0.display())]
+    NonUtf8Path(PathBuf),
+    #[error("failed to start QEMU: {0}")]
+    Spawn(#[source] io::Error),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Accelerator {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Kvm,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     Whpx,
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     Tcg,
 }
 
 impl Accelerator {
-    pub fn description(&self) -> &'static str {
+    pub fn description(self) -> &'static str {
         match self {
             Accelerator::Kvm => "KVM (falls back to TCG)",
             Accelerator::Whpx => "WHPX (falls back to TCG)",
@@ -27,7 +41,7 @@ impl Accelerator {
 
     /// Values for repeated `-accel` options, in priority order. QEMU uses the
     /// first accelerator that initializes, so hardware ones are followed by TCG.
-    pub fn accel_values(&self) -> &'static [&'static str] {
+    pub fn accel_values(self) -> &'static [&'static str] {
         match self {
             Accelerator::Kvm => &["kvm", "tcg,thread=multi"],
             Accelerator::Whpx => &["whpx", "tcg,thread=multi"],
@@ -39,12 +53,17 @@ impl Accelerator {
 pub fn detect_accelerator() -> Accelerator {
     #[cfg(target_os = "linux")]
     {
-        if Path::new("/dev/kvm").exists() {
-            if File::options().read(true).write(true).open("/dev/kvm").is_ok() {
-                return Accelerator::Kvm;
-            }
+        // Opening read/write checks both that KVM exists and that we may use it.
+        if std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open("/dev/kvm")
+            .is_ok()
+        {
+            Accelerator::Kvm
+        } else {
+            Accelerator::Tcg
         }
-        Accelerator::Tcg
     }
 
     #[cfg(target_os = "windows")]
@@ -67,14 +86,8 @@ pub fn detect_qemu() -> Option<PathBuf> {
         }
     }
 
-    // Check system PATH
-    let binary_name = if cfg!(windows) {
-        "qemu-system-x86_64.exe"
-    } else {
-        "qemu-system-x86_64"
-    };
-
-    if let Ok(path) = which(binary_name) {
+    // Check system PATH (`which` adds `.exe` on Windows itself)
+    if let Ok(path) = which("qemu-system-x86_64") {
         return Some(path);
     }
 
@@ -85,11 +98,8 @@ pub fn detect_qemu() -> Option<PathBuf> {
             "C:\\Program Files\\qemu\\qemu-system-x86_64.exe",
             "C:\\Program Files (x86)\\qemu\\qemu-system-x86_64.exe",
         ];
-        for p in std_paths {
-            let path = PathBuf::from(p);
-            if path.exists() {
-                return Some(path);
-            }
+        if let Some(path) = std_paths.iter().map(PathBuf::from).find(|p| p.exists()) {
+            return Some(path);
         }
     }
 
@@ -99,7 +109,7 @@ pub fn detect_qemu() -> Option<PathBuf> {
 #[derive(Debug, Clone)]
 pub struct VmConfig {
     pub qemu_path: PathBuf,
-    pub iso_path: PathBuf,
+    pub image_path: PathBuf,
     pub ram_mb: u32,
     pub cores: u32,
     pub accel: Accelerator,
@@ -113,31 +123,35 @@ pub struct VmConfig {
 /// explicit `format=` is always given so QEMU never probes the image format.
 /// `-cdrom <file>` takes the path as one raw argv entry (verified against
 /// QEMU 11: a comma in an ISO path is NOT parsed), so ISOs stay lossless.
-pub fn build_args(config: &VmConfig) -> Result<Vec<OsString>, String> {
+pub fn build_args(config: &VmConfig) -> Result<Vec<OsString>, VmError> {
     let mut args: Vec<OsString> = Vec::new();
 
-    let ext = config.iso_path.extension()
+    let ext = config
+        .image_path
+        .extension()
         .and_then(|e| e.to_str())
-        .map(|e| e.to_lowercase())
+        .map(str::to_lowercase)
         .unwrap_or_default();
 
     if ext == "iso" {
         args.push("-cdrom".into());
-        args.push(config.iso_path.clone().into_os_string());
+        args.push(config.image_path.clone().into_os_string());
         args.push("-boot".into());
         args.push("d".into());
     } else {
         // Raw disk image / USB image (.img, .raw, .qcow2, ...)
-        let path = config.iso_path.to_str().ok_or_else(|| {
-            format!(
-                "Disk image path is not valid UTF-8 and cannot be passed to QEMU safely: {}",
-                config.iso_path.display()
-            )
-        })?;
+        let path = config
+            .image_path
+            .to_str()
+            .ok_or_else(|| VmError::NonUtf8Path(config.image_path.clone()))?;
         args.push("-drive".into());
         args.push(
-            format!("file={},format={},if=ide,media=disk", path.replace(',', ",,"), drive_format(&ext))
-                .into(),
+            format!(
+                "file={},format={},if=ide,media=disk",
+                path.replace(',', ",,"),
+                drive_format(&ext)
+            )
+            .into(),
         );
         args.push("-boot".into());
         args.push("c".into());
@@ -150,9 +164,9 @@ pub fn build_args(config: &VmConfig) -> Result<Vec<OsString>, String> {
     args.push("-vga".into());
     args.push("std".into());
 
-    for v in config.accel.accel_values() {
+    for &value in config.accel.accel_values() {
         args.push("-accel".into());
-        args.push((*v).into());
+        args.push(value.into());
     }
 
     if config.enable_network {
@@ -215,9 +229,9 @@ impl VmExit {
     pub fn summary(&self) -> String {
         match &self.kind {
             ExitKind::Success => "Exited (code 0)".to_string(),
-            ExitKind::Failed(code) => format!("QEMU failed (exit code {})", code),
+            ExitKind::Failed(code) => format!("QEMU failed (exit code {code})"),
             ExitKind::Signaled => "QEMU terminated by signal".to_string(),
-            ExitKind::WaitError(e) => format!("Error: process error: {}", e),
+            ExitKind::WaitError(e) => format!("Error: process error: {e}"),
         }
     }
 }
@@ -253,7 +267,11 @@ impl StderrTail {
     }
 
     fn text(&self) -> String {
-        self.lines.iter().map(String::as_str).collect::<Vec<_>>().join("\n")
+        self.lines
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
@@ -308,14 +326,20 @@ fn spawn_stderr_reader<R: Read + Send + 'static>(
         let mut buf = Vec::new();
         loop {
             buf.clear();
-            match reader.by_ref().take(MAX_LINE_READ).read_until(b'\n', &mut buf) {
+            match reader
+                .by_ref()
+                .take(MAX_LINE_READ)
+                .read_until(b'\n', &mut buf)
+            {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {
                     let raw = String::from_utf8_lossy(&buf);
                     let raw = raw.trim_end_matches(['\n', '\r']);
-                    eprintln!("{}", raw);
+                    eprintln!("{raw}");
                     let clean = sanitize(raw);
-                    tail.lock().unwrap_or_else(|e| e.into_inner()).push(clean);
+                    tail.lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push(clean);
                 }
             }
         }
@@ -327,6 +351,12 @@ pub struct VmRunner {
     active_process: Arc<Mutex<Option<Child>>>,
 }
 
+impl Default for VmRunner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl VmRunner {
     pub fn new() -> Self {
         Self {
@@ -334,7 +364,7 @@ impl VmRunner {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg_attr(not(all(test, unix)), allow(dead_code))]
     pub fn is_running(&self) -> bool {
         self.active_process.lock().unwrap().is_some()
     }
@@ -342,7 +372,7 @@ impl VmRunner {
     /// Kills the running VM and clears the slot. The waiter thread notices the
     /// empty slot and exits without calling `on_exit`, so the caller is
     /// responsible for reporting the user-initiated stop.
-    pub fn stop(&self) -> Result<(), String> {
+    pub fn stop(&self) -> Result<(), VmError> {
         let child = self.active_process.lock().unwrap().take();
         match child {
             Some(mut child) => {
@@ -350,34 +380,33 @@ impl VmRunner {
                 let _ = child.wait();
                 Ok(())
             }
-            None => Err("No VM is currently running".to_string()),
+            None => Err(VmError::NotRunning),
         }
     }
 
-    pub fn launch<F>(&self, config: VmConfig, on_exit: F) -> Result<(), String>
+    pub fn launch<F>(&self, config: &VmConfig, on_exit: F) -> Result<(), VmError>
     where
         F: FnOnce(VmExit) + Send + 'static,
     {
         let mut lock = self.active_process.lock().unwrap();
         if lock.is_some() {
-            return Err("A VM is already running".to_string());
+            return Err(VmError::AlreadyRunning);
         }
 
         let mut cmd = Command::new(&config.qemu_path);
-        cmd.args(build_args(&config)?);
+        cmd.args(build_args(config)?);
 
-        cmd.stdout(Stdio::inherit())
-           .stderr(Stdio::piped());
+        cmd.stdout(Stdio::inherit()).stderr(Stdio::piped());
 
-        let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn QEMU: {}", e))?;
+        let mut child = cmd.spawn().map_err(VmError::Spawn)?;
         let tail = Arc::new(Mutex::new(StderrTail::default()));
         let (done_tx, done_rx) = mpsc::channel();
         match child.stderr.take() {
-            Some(stderr) => spawn_stderr_reader(stderr, tail.clone(), done_tx),
+            Some(stderr) => spawn_stderr_reader(stderr, Arc::clone(&tail), done_tx),
             None => drop(done_tx),
         }
         let pid = child.id();
-        let proc_handle = self.active_process.clone();
+        let proc_handle = Arc::clone(&self.active_process);
         *lock = Some(child);
         drop(lock);
 
@@ -410,8 +439,11 @@ impl VmRunner {
             // Let the reader reach EOF so the tail is complete, but never hang
             // if the pipe is held open (e.g. by an orphaned grandchild).
             let _ = done_rx.recv_timeout(READER_JOIN_TIMEOUT);
-            let stderr_tail = tail.lock().unwrap_or_else(|e| e.into_inner()).text();
-            on_exit(VmExit { kind: result, stderr_tail });
+            let stderr_tail = tail.lock().unwrap_or_else(PoisonError::into_inner).text();
+            on_exit(VmExit {
+                kind: result,
+                stderr_tail,
+            });
         });
 
         Ok(())
@@ -429,19 +461,28 @@ mod tests {
     // script creation and spawning across tests.
     static SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
-    fn launch_script<F>(runner: &VmRunner, name: &str, body: &str, on_exit: F) -> Result<(), String>
+    fn launch_script<F>(
+        runner: &VmRunner,
+        name: &str,
+        body: &str,
+        on_exit: F,
+    ) -> Result<(), VmError>
     where
         F: FnOnce(VmExit) + Send + 'static,
     {
-        let _g = SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        runner.launch(cfg(script(name, body)), on_exit)
+        let _g = SPAWN_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        runner.launch(&cfg(script(name, body)), on_exit)
     }
 
     fn script(name: &str, body: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("liveiso-runner-test-{}-{}", name, std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "liveiso-runner-test-{}-{}",
+            name,
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("fake-qemu.sh");
-        std::fs::write(&p, format!("#!/bin/sh\n{}\n", body)).unwrap();
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
         p
     }
@@ -449,7 +490,7 @@ mod tests {
     fn cfg(qemu_path: PathBuf) -> VmConfig {
         VmConfig {
             qemu_path,
-            iso_path: PathBuf::from("x.iso"),
+            image_path: PathBuf::from("x.iso"),
             ram_mb: 64,
             cores: 1,
             accel: Accelerator::Tcg,
@@ -461,9 +502,14 @@ mod tests {
     fn launch_stop_lifecycle() {
         let runner = VmRunner::new();
         let (tx, rx) = mpsc::channel();
-        launch_script(&runner, "stop", "exec sleep 30", move |r| tx.send(r).unwrap()).unwrap();
+        launch_script(&runner, "stop", "exec sleep 30", move |r| {
+            tx.send(r).unwrap();
+        })
+        .unwrap();
         assert!(runner.is_running());
-        assert!(runner.launch(cfg(PathBuf::from("/bin/true")), |_| {}).is_err());
+        assert!(runner
+            .launch(&cfg(PathBuf::from("/bin/true")), |_| {})
+            .is_err());
         runner.stop().unwrap();
         assert!(!runner.is_running());
         assert!(runner.stop().is_err());
@@ -476,7 +522,10 @@ mod tests {
         let runner = VmRunner::new();
         let (tx, rx) = mpsc::channel();
         launch_script(&runner, "exit", "exit 3", move |r| tx.send(r).unwrap()).unwrap();
-        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap().kind, ExitKind::Failed(3));
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap().kind,
+            ExitKind::Failed(3)
+        );
         assert!(rx.recv_timeout(Duration::from_millis(500)).is_err());
         assert!(!runner.is_running());
     }
@@ -486,7 +535,10 @@ mod tests {
         let runner = VmRunner::new();
         let (tx, rx) = mpsc::channel();
         launch_script(&runner, "sig", "kill -9 $$", move |r| tx.send(r).unwrap()).unwrap();
-        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap().kind, ExitKind::Signaled);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap().kind,
+            ExitKind::Signaled
+        );
     }
 
     fn run_script(name: &str, body: &str) -> VmExit {
@@ -501,13 +553,20 @@ mod tests {
         let exit = run_script("boom", "echo 'boom: something failed' >&2; exit 1");
         assert_eq!(exit.kind, ExitKind::Failed(1));
         assert!(!exit.is_success());
-        assert!(exit.stderr_tail.contains("boom: something failed"), "{:?}", exit.stderr_tail);
+        assert!(
+            exit.stderr_tail.contains("boom: something failed"),
+            "{:?}",
+            exit.stderr_tail
+        );
         assert_eq!(exit.summary(), "QEMU failed (exit code 1)");
     }
 
     #[test]
     fn stderr_tail_is_bounded() {
-        let exit = run_script("many", "i=1; while [ $i -le 1000 ]; do echo \"line $i\" >&2; i=$((i+1)); done; exit 2");
+        let exit = run_script(
+            "many",
+            "i=1; while [ $i -le 1000 ]; do echo \"line $i\" >&2; i=$((i+1)); done; exit 2",
+        );
         assert_eq!(exit.kind, ExitKind::Failed(2));
         assert!(exit.stderr_tail.contains("line 1000"));
         assert!(!exit.stderr_tail.lines().any(|l| l == "line 1"));
@@ -518,13 +577,22 @@ mod tests {
     #[test]
     fn success_has_empty_tail() {
         let exit = run_script("ok", "exit 0");
-        assert_eq!(exit, VmExit { kind: ExitKind::Success, stderr_tail: String::new() });
+        assert_eq!(
+            exit,
+            VmExit {
+                kind: ExitKind::Success,
+                stderr_tail: String::new()
+            }
+        );
         assert!(exit.is_success());
     }
 
     #[test]
     fn stderr_is_sanitized() {
-        let exit = run_script("ansi", "printf '\\033[31mred\\033[0m \\033]0;title\\007ok\\r\\n' >&2; exit 1");
+        let exit = run_script(
+            "ansi",
+            "printf '\\033[31mred\\033[0m \\033]0;title\\007ok\\r\\n' >&2; exit 1",
+        );
         assert_eq!(exit.stderr_tail, "red ok");
     }
 
@@ -540,9 +608,11 @@ mod tests {
 
     /// Real-QEMU check; run with `cargo test -- --ignored`.
     #[test]
-    #[ignore]
+    #[ignore = "needs a real QEMU at ~/.local/bin"]
     fn real_qemu_missing_image_reports_error() {
-        let Some(home) = std::env::var_os("HOME") else { return };
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
         let qemu = PathBuf::from(home).join(".local/bin/qemu-system-x86_64");
         if !qemu.exists() {
             eprintln!("skipping: {} not found", qemu.display());
@@ -551,12 +621,16 @@ mod tests {
         let runner = VmRunner::new();
         let (tx, rx) = mpsc::channel();
         let mut c = cfg(qemu);
-        c.iso_path = PathBuf::from("/nonexistent/definitely-missing.iso");
-        runner.launch(c, move |r| tx.send(r).unwrap()).unwrap();
+        c.image_path = PathBuf::from("/nonexistent/definitely-missing.iso");
+        runner.launch(&c, move |r| tx.send(r).unwrap()).unwrap();
         let exit = rx.recv_timeout(Duration::from_secs(20)).unwrap();
-        eprintln!("exit: {:?}", exit);
+        eprintln!("exit: {exit:?}");
         assert!(matches!(exit.kind, ExitKind::Failed(_)));
-        assert!(exit.stderr_tail.contains("Could not open"), "{:?}", exit.stderr_tail);
+        assert!(
+            exit.stderr_tail.contains("Could not open"),
+            "{:?}",
+            exit.stderr_tail
+        );
     }
 }
 
@@ -567,7 +641,7 @@ mod args_tests {
     fn config(iso: &str, accel: Accelerator) -> VmConfig {
         VmConfig {
             qemu_path: PathBuf::from("qemu"),
-            iso_path: PathBuf::from(iso),
+            image_path: PathBuf::from(iso),
             ram_mb: 512,
             cores: 2,
             accel,
@@ -576,7 +650,11 @@ mod args_tests {
     }
 
     fn accel_seq(c: &VmConfig) -> Vec<String> {
-        let args: Vec<String> = build_args(c).unwrap().iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let args: Vec<String> = build_args(c)
+            .unwrap()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
         let mut out = Vec::new();
         for (i, a) in args.iter().enumerate() {
             if a == "-accel" {
@@ -588,23 +666,35 @@ mod args_tests {
 
     #[test]
     fn kvm_accel_sequence() {
-        assert_eq!(accel_seq(&config("a.iso", Accelerator::Kvm)), ["kvm", "tcg,thread=multi"]);
+        assert_eq!(
+            accel_seq(&config("a.iso", Accelerator::Kvm)),
+            ["kvm", "tcg,thread=multi"]
+        );
     }
 
     #[test]
     fn whpx_accel_sequence() {
-        assert_eq!(accel_seq(&config("a.iso", Accelerator::Whpx)), ["whpx", "tcg,thread=multi"]);
+        assert_eq!(
+            accel_seq(&config("a.iso", Accelerator::Whpx)),
+            ["whpx", "tcg,thread=multi"]
+        );
     }
 
     #[test]
     fn tcg_accel_sequence() {
-        assert_eq!(accel_seq(&config("a.iso", Accelerator::Tcg)), ["tcg,thread=multi"]);
+        assert_eq!(
+            accel_seq(&config("a.iso", Accelerator::Tcg)),
+            ["tcg,thread=multi"]
+        );
     }
 
     #[test]
     fn iso_uses_cdrom_and_boot_d() {
         let args = build_args(&config("a.ISO", Accelerator::Tcg)).unwrap();
-        assert_eq!(&args[..4], ["-cdrom", "a.ISO", "-boot", "d"].map(OsString::from));
+        assert_eq!(
+            &args[..4],
+            ["-cdrom", "a.ISO", "-boot", "d"].map(OsString::from)
+        );
     }
 
     #[test]
@@ -612,7 +702,13 @@ mod args_tests {
         let args = build_args(&config("a.img", Accelerator::Tcg)).unwrap();
         assert_eq!(
             &args[..4],
-            ["-drive", "file=a.img,format=raw,if=ide,media=disk", "-boot", "c"].map(OsString::from)
+            [
+                "-drive",
+                "file=a.img,format=raw,if=ide,media=disk",
+                "-boot",
+                "c"
+            ]
+            .map(OsString::from)
         );
     }
 
@@ -622,7 +718,10 @@ mod args_tests {
 
     #[test]
     fn drive_path_commas_are_doubled() {
-        assert_eq!(drive_value("a,b.img"), OsString::from("file=a,,b.img,format=raw,if=ide,media=disk"));
+        assert_eq!(
+            drive_value("a,b.img"),
+            OsString::from("file=a,,b.img,format=raw,if=ide,media=disk")
+        );
         assert_eq!(
             drive_value("/tmp/a,format=qcow2.img"),
             OsString::from("file=/tmp/a,,format=qcow2.img,format=raw,if=ide,media=disk")
@@ -632,9 +731,16 @@ mod args_tests {
     #[test]
     fn drive_format_mapping() {
         for (name, fmt) in [
-            ("a.qcow2", "qcow2"), ("a.vmdk", "vmdk"), ("a.vdi", "vdi"), ("a.vhd", "vpc"),
-            ("a.vhdx", "vhdx"), ("a.IMG", "raw"), ("a.QCOW2", "qcow2"), ("a.raw", "raw"),
-            ("a.xyz", "raw"), ("noext", "raw"),
+            ("a.qcow2", "qcow2"),
+            ("a.vmdk", "vmdk"),
+            ("a.vdi", "vdi"),
+            ("a.vhd", "vpc"),
+            ("a.vhdx", "vhdx"),
+            ("a.IMG", "raw"),
+            ("a.QCOW2", "qcow2"),
+            ("a.raw", "raw"),
+            ("a.xyz", "raw"),
+            ("noext", "raw"),
         ] {
             assert_eq!(
                 drive_value(name),
@@ -645,9 +751,12 @@ mod args_tests {
     }
 
     #[test]
-    fn iso_path_is_passed_verbatim_even_with_commas() {
+    fn image_path_is_passed_verbatim_even_with_commas() {
         let args = build_args(&config("/x/my,disk.iso", Accelerator::Tcg)).unwrap();
-        assert_eq!(&args[..4], ["-cdrom", "/x/my,disk.iso", "-boot", "d"].map(OsString::from));
+        assert_eq!(
+            &args[..4],
+            ["-cdrom", "/x/my,disk.iso", "-boot", "d"].map(OsString::from)
+        );
     }
 
     #[cfg(unix)]
@@ -658,13 +767,13 @@ mod args_tests {
             let mut v = b"/x/\xff".to_vec();
             v.extend_from_slice(name.as_bytes());
             let mut c = config("a.img", Accelerator::Tcg);
-            c.iso_path = PathBuf::from(OsString::from_vec(v));
+            c.image_path = PathBuf::from(OsString::from_vec(v));
             c
         };
         let err = build_args(&bad(".img")).unwrap_err();
-        assert!(err.contains("UTF-8"), "{err}");
+        assert!(matches!(err, VmError::NonUtf8Path(_)), "{err}");
         let iso = bad(".iso");
         let args = build_args(&iso).unwrap();
-        assert_eq!(args[1], iso.iso_path.clone().into_os_string());
+        assert_eq!(args[1], iso.image_path.clone().into_os_string());
     }
 }

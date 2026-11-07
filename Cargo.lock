@@ -2591,6 +2591,7 @@ dependencies = [
  "rfd",
  "slint",
  "slint-build",
+ "thiserror 2.0.21",
  "which",
  "winreg",
 ]
