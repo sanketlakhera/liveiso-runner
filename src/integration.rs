@@ -10,10 +10,14 @@ use std::path::PathBuf;
 use winreg::{enums::HKEY_CURRENT_USER, RegKey};
 
 #[cfg(windows)]
-const WIN_KEY: &str = "Software\\Classes\\.iso\\shell\\LiveISORunner";
-/// Key written by builds released under the old name; removed on uninstall.
+const WIN_KEY: &str = "Software\\Classes\\SystemFileAssociations\\.iso\\shell\\LiveISORunner";
+/// Keys written by earlier builds (the verb directly under `.iso` is ignored
+/// when the extension has its own ProgID); removed on install and uninstall.
 #[cfg(windows)]
-const LEGACY_WIN_KEY: &str = "Software\\Classes\\.iso\\shell\\MobaLiveCD";
+const LEGACY_WIN_KEYS: [&str; 2] = [
+    "Software\\Classes\\.iso\\shell\\LiveISORunner",
+    "Software\\Classes\\.iso\\shell\\MobaLiveCD",
+];
 
 #[derive(Debug, thiserror::Error)]
 pub enum IntegrationError {
@@ -95,6 +99,9 @@ pub fn install() -> Result<(), IntegrationError> {
     #[cfg(target_os = "windows")]
     {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        for k in LEGACY_WIN_KEYS {
+            let _ = hkcu.delete_subkey_all(k);
+        }
         let (key, _) = hkcu
             .create_subkey(WIN_KEY)
             .map_err(io_context("failed to create registry key"))?;
@@ -144,7 +151,9 @@ pub fn uninstall() -> Result<(), IntegrationError> {
     {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let _ = hkcu.delete_subkey_all(WIN_KEY);
-        let _ = hkcu.delete_subkey_all(LEGACY_WIN_KEY);
+        for k in LEGACY_WIN_KEYS {
+            let _ = hkcu.delete_subkey_all(k);
+        }
         Ok(())
     }
 

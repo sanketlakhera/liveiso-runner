@@ -22,7 +22,7 @@ Written in **Rust** using **Slint** for native GUI rendering on both **Linux** a
   - Virtual network toggle (User NAT)
 - **OS File Association & Context Menu**:
   - **Linux**: One-click install/uninstall for file managers (`.desktop` MIME association for `application/x-cd-image`).
-  - **Windows**: Non-admin user context menu integration (`HKCU\Software\Classes\.iso\shell`).
+  - **Windows**: Non-admin user context menu integration (`HKCU\Software\Classes\SystemFileAssociations\.iso\shell`).
 - **CLI Image Passing**:
   - Pass an ISO directly on the command line:
     ```bash
