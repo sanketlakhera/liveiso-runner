@@ -12,8 +12,8 @@ Written in **Rust** using **Slint** for native GUI rendering on both **Linux** a
 
 - **Direct LiveCD Execution**: Run any `.iso`, `.img`, `.raw`, or `.qcow2` image without burning media or setting up a complex virtual machine.
 - **Hardware Acceleration**:
-  - **Linux**: Automatically uses **KVM** (`-accel kvm`) when available, with automatic multi-threaded **TCG** fallback.
-  - **Windows**: Uses **WHPX** (Windows Hypervisor Platform) or TCG.
+  - **Linux**: Uses **KVM** when `/dev/kvm` is accessible (`-accel kvm -accel tcg,thread=multi`); otherwise multi-threaded **TCG** only.
+  - **Windows**: Requests **WHPX** (Windows Hypervisor Platform) and passes a TCG fallback (`-accel whpx -accel tcg,thread=multi`), so QEMU falls back to TCG if WHPX is not enabled.
 - **Modern Hardware Configuration**:
   - Memory selection (512 MB to 8192 MB)
   - Multi-core CPU allocation (1 to 8 cores)

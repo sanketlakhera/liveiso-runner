@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -16,17 +17,19 @@ pub enum Accelerator {
 impl Accelerator {
     pub fn description(&self) -> &'static str {
         match self {
-            Accelerator::Kvm => "Hardware KVM (Fast)",
-            Accelerator::Whpx => "Hardware WHPX (Fast)",
-            Accelerator::Tcg => "Software TCG (Safe Fallback)",
+            Accelerator::Kvm => "KVM (falls back to TCG)",
+            Accelerator::Whpx => "WHPX (falls back to TCG)",
+            Accelerator::Tcg => "Software TCG",
         }
     }
 
-    pub fn flag(&self) -> &'static str {
+    /// Values for repeated `-accel` options, in priority order. QEMU uses the
+    /// first accelerator that initializes, so hardware ones are followed by TCG.
+    pub fn accel_values(&self) -> &'static [&'static str] {
         match self {
-            Accelerator::Kvm => "kvm",
-            Accelerator::Whpx => "whpx",
-            Accelerator::Tcg => "tcg,thread=multi",
+            Accelerator::Kvm => &["kvm", "tcg,thread=multi"],
+            Accelerator::Whpx => &["whpx", "tcg,thread=multi"],
+            Accelerator::Tcg => &["tcg,thread=multi"],
         }
     }
 }
@@ -101,6 +104,49 @@ pub struct VmConfig {
     pub enable_network: bool,
 }
 
+/// Builds the QEMU command-line arguments (excluding the program path).
+pub fn build_args(config: &VmConfig) -> Vec<OsString> {
+    let mut args: Vec<OsString> = Vec::new();
+
+    let ext = config.iso_path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .unwrap_or_default();
+
+    if ext == "iso" {
+        args.push("-cdrom".into());
+        args.push(config.iso_path.clone().into_os_string());
+        args.push("-boot".into());
+        args.push("d".into());
+    } else {
+        // Raw disk image / USB image (.img, .raw, .qcow2)
+        args.push("-drive".into());
+        args.push(format!("file={},if=ide", config.iso_path.display()).into());
+        args.push("-boot".into());
+        args.push("c".into());
+    }
+
+    args.push("-m".into());
+    args.push(format!("{}M", config.ram_mb).into());
+    args.push("-smp".into());
+    args.push(format!("cores={}", config.cores).into());
+    args.push("-vga".into());
+    args.push("std".into());
+
+    for v in config.accel.accel_values() {
+        args.push("-accel".into());
+        args.push((*v).into());
+    }
+
+    if config.enable_network {
+        args.extend(["-net", "nic", "-net", "user"].map(OsString::from));
+    } else {
+        args.extend(["-net", "none"].map(OsString::from));
+    }
+
+    args
+}
+
 pub struct VmRunner {
     active_process: Arc<Mutex<Option<Child>>>,
 }
@@ -142,31 +188,7 @@ impl VmRunner {
         }
 
         let mut cmd = Command::new(&config.qemu_path);
-
-        let ext = config.iso_path.extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_lowercase())
-            .unwrap_or_default();
-
-        if ext == "iso" {
-            cmd.arg("-cdrom").arg(&config.iso_path)
-               .arg("-boot").arg("d");
-        } else {
-            // Raw disk image / USB image (.img, .raw, .qcow2)
-            cmd.arg("-drive").arg(format!("file={},if=ide", config.iso_path.display()))
-               .arg("-boot").arg("c");
-        }
-
-        cmd.arg("-m").arg(format!("{}M", config.ram_mb))
-           .arg("-smp").arg(format!("cores={}", config.cores))
-           .arg("-vga").arg("std")
-           .arg("-accel").arg(config.accel.flag());
-
-        if config.enable_network {
-            cmd.arg("-net").arg("nic").arg("-net").arg("user");
-        } else {
-            cmd.arg("-net").arg("none");
-        }
+        cmd.args(build_args(&config));
 
         cmd.stdout(Stdio::inherit())
            .stderr(Stdio::inherit());
@@ -278,5 +300,59 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         launch_script(&runner, "sig", "kill -9 $$", move |r| tx.send(r).unwrap()).unwrap();
         assert!(rx.recv_timeout(Duration::from_secs(5)).unwrap().is_err());
+    }
+}
+
+#[cfg(test)]
+mod args_tests {
+    use super::*;
+
+    fn config(iso: &str, accel: Accelerator) -> VmConfig {
+        VmConfig {
+            qemu_path: PathBuf::from("qemu"),
+            iso_path: PathBuf::from(iso),
+            ram_mb: 512,
+            cores: 2,
+            accel,
+            enable_network: false,
+        }
+    }
+
+    fn accel_seq(c: &VmConfig) -> Vec<String> {
+        let args: Vec<String> = build_args(c).iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        let mut out = Vec::new();
+        for (i, a) in args.iter().enumerate() {
+            if a == "-accel" {
+                out.push(args[i + 1].clone());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn kvm_accel_sequence() {
+        assert_eq!(accel_seq(&config("a.iso", Accelerator::Kvm)), ["kvm", "tcg,thread=multi"]);
+    }
+
+    #[test]
+    fn whpx_accel_sequence() {
+        assert_eq!(accel_seq(&config("a.iso", Accelerator::Whpx)), ["whpx", "tcg,thread=multi"]);
+    }
+
+    #[test]
+    fn tcg_accel_sequence() {
+        assert_eq!(accel_seq(&config("a.iso", Accelerator::Tcg)), ["tcg,thread=multi"]);
+    }
+
+    #[test]
+    fn iso_uses_cdrom_and_boot_d() {
+        let args = build_args(&config("a.ISO", Accelerator::Tcg));
+        assert_eq!(&args[..4], ["-cdrom", "a.ISO", "-boot", "d"].map(OsString::from));
+    }
+
+    #[test]
+    fn img_uses_drive_and_boot_c() {
+        let args = build_args(&config("a.img", Accelerator::Tcg));
+        assert_eq!(&args[..4], ["-drive", "file=a.img,if=ide", "-boot", "c"].map(OsString::from));
     }
 }
