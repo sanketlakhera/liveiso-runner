@@ -204,7 +204,7 @@ export component AppWindow inherits Window {
                         spacing: 10px;
                         LineEdit {
                             text: root.iso-path;
-                            placeholder-text: "Click Browse or drag & drop a bootable ISO file here...";
+                            placeholder-text: "Click Browse... or type the path to an ISO or disk image";
                             horizontal-stretch: 1;
                             edited(new-text) => { root.iso-path = new-text; }
                         }
