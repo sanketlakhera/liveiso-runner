@@ -79,13 +79,14 @@ component Card inherits Rectangle {
     border-radius: 8px;
     border-width: 1px;
     border-color: #3b4252;
+    // Keep cards at their natural height; spare space goes to the spacer.
+    vertical-stretch: 0;
 
     VerticalBox {
         padding: 16px;
         spacing: 10px;
 
-        HorizontalBox {
-            padding: 0;
+        HorizontalLayout {
             spacing: 8px;
             Text {
                 text: root.title;
@@ -113,9 +114,11 @@ component Card inherits Rectangle {
 export component AppWindow inherits Window {
     title: "LiveISO Runner";
     preferred-width: 760px;
-    preferred-height: 640px;
+    // Ask for the content's natural height; if the screen is smaller the
+    // window manager shrinks the window and the ScrollView takes over.
+    preferred-height: content.preferred-height;
     min-width: 720px;
-    min-height: 600px;
+    min-height: 360px;
     background: #191c24;
 
     in-out property <string> iso-path: "";
@@ -143,273 +146,270 @@ export component AppWindow inherits Window {
     callback uninstall-integration();
     callback browse-qemu();
 
-    VerticalBox {
-        padding: 20px;
-        spacing: 14px;
+    ScrollView {
+        content := VerticalLayout {
+            padding: 20px;
+            spacing: 14px;
 
-        // Header
-        HorizontalBox {
-            spacing: 12px;
-            VerticalBox {
-                padding: 0;
-                spacing: 4px;
-                HorizontalBox {
-                    spacing: 8px;
-                    Text {
-                        text: "LiveISO Runner";
-                        font-size: 22px;
-                        font-weight: 800;
-                        color: #eceff4;
-                    }
-                    Rectangle {
-                        background: #4c566a;
-                        border-radius: 4px;
-                        height: 22px;
-                        y: 4px;
-                        HorizontalBox {
-                            padding-left: 6px;
-                            padding-right: 6px;
-                            Text {
-                                text: "Rust Edition";
-                                font-size: 11px;
-                                font-weight: 600;
-                                color: #88c0d0;
-                                vertical-alignment: center;
-                                horizontal-alignment: center;
+            // Header
+            HorizontalLayout {
+                spacing: 12px;
+                VerticalLayout {
+                    spacing: 4px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "LiveISO Runner";
+                            font-size: 22px;
+                            font-weight: 800;
+                            color: #eceff4;
+                        }
+                        Rectangle {
+                            background: #4c566a;
+                            border-radius: 4px;
+                            height: 22px;
+                            HorizontalLayout {
+                                padding-left: 6px;
+                                padding-right: 6px;
+                                Text {
+                                    text: "Rust Edition";
+                                    font-size: 11px;
+                                    font-weight: 600;
+                                    color: #88c0d0;
+                                    vertical-alignment: center;
+                                    horizontal-alignment: center;
+                                }
                             }
                         }
                     }
+                    Text {
+                        text: "Fast, modern bootable ISO & LiveCD tester for Windows and Linux";
+                        font-size: 12px;
+                        color: #d8dee9;
+                    }
                 }
-                Text {
-                    text: "Fast, modern bootable ISO & LiveCD tester for Windows and Linux";
-                    font-size: 12px;
-                    color: #d8dee9;
-                }
+                Rectangle { horizontal-stretch: 1; }
             }
-            Rectangle { horizontal-stretch: 1; }
-        }
 
-        // Section 1: LiveCD Image Selection & Quick Run
-        Card {
-            title: "LiveCD Image";
-            subtitle: "Select an ISO, IMG, or disk image to run";
+            // Section 1: LiveCD Image Selection & Quick Run
+            Card {
+                title: "LiveCD Image";
+                subtitle: "Select an ISO, IMG, or disk image to run";
 
-            VerticalBox {
-                padding: 0;
-                spacing: 10px;
-
-                HorizontalBox {
+                VerticalBox {
+                    padding: 0;
                     spacing: 10px;
-                    LineEdit {
-                        text: root.iso-path;
-                        placeholder-text: "Click Browse or drag & drop a bootable ISO file here...";
-                        horizontal-stretch: 1;
-                        edited(new-text) => { root.iso-path = new-text; }
-                    }
-                    Button {
-                        text: "Browse...";
-                        clicked => { root.browse-iso(); }
-                    }
-                }
 
-                HorizontalBox {
-                    Text {
-                        text: root.iso-info;
-                        font-size: 11px;
-                        color: #d8dee9;
-                    }
-                    Rectangle { horizontal-stretch: 1; }
-                    Text {
-                        text: "Status: " + root.vm-status;
-                        font-size: 12px;
-                        font-weight: 600;
-                        color: root.is-vm-running ? #a3be8c : (root.vm-error != "" ? #bf616a : #ebcb8b);
-                    }
-                }
-
-                if root.vm-error != "": VerticalBox {
-                    padding: 0;
-                    spacing: 4px;
-                    Text {
-                        text: "QEMU error output:";
-                        font-size: 11px;
-                        font-weight: 600;
-                        color: #bf616a;
-                    }
-                    Rectangle {
-                        background: #2e3440;
-                        border-radius: 4px;
-                        border-width: 1px;
-                        border-color: #bf616a;
-                        height: 120px;
-                        TextEdit {
-                            text: root.vm-error;
-                            read-only: true;
-                            font-size: 11px;
-                            wrap: word-wrap;
+                    HorizontalLayout {
+                        spacing: 10px;
+                        LineEdit {
+                            text: root.iso-path;
+                            placeholder-text: "Click Browse or drag & drop a bootable ISO file here...";
+                            horizontal-stretch: 1;
+                            edited(new-text) => { root.iso-path = new-text; }
+                        }
+                        Button {
+                            text: "Browse...";
+                            clicked => { root.browse-iso(); }
                         }
                     }
-                }
 
-                HorizontalBox {
-                    spacing: 12px;
-                    Button {
-                        text: root.is-vm-running ? "VM Running..." : "▶  Run LiveCD";
-                        primary: true;
-                        enabled: !root.is-vm-running && root.iso-path != "";
-                        horizontal-stretch: 2;
-                        height: 38px;
-                        clicked => { root.run-vm(); }
+                    HorizontalLayout {
+                        Text {
+                            text: root.iso-info;
+                            font-size: 11px;
+                            color: #d8dee9;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        Text {
+                            text: "Status: " + root.vm-status;
+                            font-size: 12px;
+                            font-weight: 600;
+                            color: root.is-vm-running ? #a3be8c : (root.vm-error != "" ? #bf616a : #ebcb8b);
+                        }
                     }
-                    if root.is-vm-running: Button {
-                        text: "⏹  Stop VM";
-                        horizontal-stretch: 1;
-                        height: 38px;
-                        clicked => { root.stop-vm(); }
-                    }
-                }
-            }
-        }
 
-        // Section 2: Virtual Machine Configuration
-        Card {
-            title: "VM Configuration";
-            subtitle: "Configure emulation parameters";
-
-            HorizontalBox {
-                spacing: 20px;
-
-                VerticalBox {
-                    padding: 0;
-                    spacing: 6px;
-                    horizontal-stretch: 1;
-                    Text { text: "Memory (RAM):"; font-size: 12px; color: #d8dee9; }
-                    ComboBox {
-                        model: ["512 MB", "1024 MB", "2048 MB", "4096 MB", "8192 MB"];
-                        current-value: root.selected-ram;
-                        selected(val) => { root.selected-ram = val; }
-                    }
-                }
-
-                VerticalBox {
-                    padding: 0;
-                    spacing: 6px;
-                    horizontal-stretch: 1;
-                    Text { text: "CPU Cores:"; font-size: 12px; color: #d8dee9; }
-                    ComboBox {
-                        model: ["1 Core", "2 Cores", "4 Cores", "8 Cores"];
-                        current-value: root.selected-cpu;
-                        selected(val) => { root.selected-cpu = val; }
-                    }
-                }
-
-                VerticalBox {
-                    padding: 0;
-                    spacing: 6px;
-                    horizontal-stretch: 1;
-                    Text { text: "Acceleration:"; font-size: 12px; color: #d8dee9; }
-                    Rectangle {
-                        background: #2e3440;
-                        border-radius: 4px;
-                        height: 32px;
-                        HorizontalBox {
-                            padding-left: 8px;
-                            padding-right: 8px;
-                            Text {
-                                text: root.accel-info;
+                    if root.vm-error != "": VerticalBox {
+                        padding: 0;
+                        spacing: 4px;
+                        Text {
+                            text: "QEMU error output:";
+                            font-size: 11px;
+                            font-weight: 600;
+                            color: #bf616a;
+                        }
+                        Rectangle {
+                            background: #2e3440;
+                            border-radius: 4px;
+                            border-width: 1px;
+                            border-color: #bf616a;
+                            height: 120px;
+                            TextEdit {
+                                text: root.vm-error;
+                                read-only: true;
                                 font-size: 11px;
-                                color: #88c0d0;
-                                vertical-alignment: center;
+                                wrap: word-wrap;
                             }
                         }
                     }
-                }
 
-                VerticalBox {
-                    padding: 0;
-                    spacing: 6px;
-                    horizontal-stretch: 1;
-                    Text { text: "Network:"; font-size: 12px; color: #d8dee9; }
-                    CheckBox {
-                        text: "Enable Network";
-                        checked: root.enable-net;
-                        toggled => { root.enable-net = self.checked; }
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Button {
+                            text: root.is-vm-running ? "VM Running..." : "▶  Run LiveCD";
+                            primary: true;
+                            enabled: !root.is-vm-running && root.iso-path != "";
+                            horizontal-stretch: 2;
+                            height: 38px;
+                            clicked => { root.run-vm(); }
+                        }
+                        if root.is-vm-running: Button {
+                            text: "⏹  Stop VM";
+                            horizontal-stretch: 1;
+                            height: 38px;
+                            clicked => { root.stop-vm(); }
+                        }
                     }
                 }
             }
-        }
 
-        // Section 3: OS Context Menu / Desktop Integration
-        Card {
-            title: "System Integration";
-            subtitle: "Right-click context menu association for .ISO files";
+            // Section 2: Virtual Machine Configuration
+            Card {
+                title: "VM Configuration";
+                subtitle: "Configure emulation parameters";
 
-            HorizontalBox {
-                spacing: 14px;
-                VerticalBox {
-                    padding: 0;
-                    spacing: 4px;
-                    horizontal-stretch: 1;
-                    Text {
-                        text: "Allows launching LiveCDs directly from your file manager right-click menu.";
-                        font-size: 12px;
-                        color: #d8dee9;
-                    }
-                    Text {
-                        text: "Current Status: " + root.integration-status;
-                        font-size: 11px;
-                        color: root.is-integrated ? #a3be8c : #d08770;
-                        font-weight: 600;
-                    }
-                }
+                HorizontalLayout {
+                    spacing: 20px;
 
-                HorizontalBox {
-                    spacing: 8px;
-                    alignment: end;
-                    Button {
-                        text: "Install Association";
-                        enabled: !root.is-integrated;
-                        clicked => { root.install-integration(); }
+                    VerticalBox {
+                        padding: 0;
+                        spacing: 6px;
+                        horizontal-stretch: 1;
+                        Text { text: "Memory (RAM):"; font-size: 12px; color: #d8dee9; }
+                        ComboBox {
+                            model: ["512 MB", "1024 MB", "2048 MB", "4096 MB", "8192 MB"];
+                            current-value: root.selected-ram;
+                            selected(val) => { root.selected-ram = val; }
+                        }
                     }
-                    Button {
-                        text: "Uninstall";
-                        enabled: root.is-integrated;
-                        clicked => { root.uninstall-integration(); }
+
+                    VerticalBox {
+                        padding: 0;
+                        spacing: 6px;
+                        horizontal-stretch: 1;
+                        Text { text: "CPU Cores:"; font-size: 12px; color: #d8dee9; }
+                        ComboBox {
+                            model: ["1 Core", "2 Cores", "4 Cores", "8 Cores"];
+                            current-value: root.selected-cpu;
+                            selected(val) => { root.selected-cpu = val; }
+                        }
+                    }
+
+                    VerticalBox {
+                        padding: 0;
+                        spacing: 6px;
+                        horizontal-stretch: 1;
+                        Text { text: "Acceleration:"; font-size: 12px; color: #d8dee9; }
+                        Rectangle {
+                            background: #2e3440;
+                            border-radius: 4px;
+                            height: 32px;
+                            HorizontalLayout {
+                                padding-left: 8px;
+                                padding-right: 8px;
+                                Text {
+                                    text: root.accel-info;
+                                    font-size: 11px;
+                                    color: #88c0d0;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                    }
+
+                    VerticalBox {
+                        padding: 0;
+                        spacing: 6px;
+                        horizontal-stretch: 1;
+                        Text { text: "Network:"; font-size: 12px; color: #d8dee9; }
+                        CheckBox {
+                            text: "Enable Network";
+                            checked: root.enable-net;
+                            toggled => { root.enable-net = self.checked; }
+                        }
                     }
                 }
             }
-        }
 
-        Rectangle { vertical-stretch: 1; }
+            // Section 3: OS Context Menu / Desktop Integration
+            Card {
+                title: "System Integration";
+                subtitle: "Right-click context menu association for .ISO files";
 
-        // Footer Bar
-        HorizontalBox {
-            spacing: 12px;
-            VerticalBox {
-                padding: 0;
-                spacing: 2px;
-                horizontal-stretch: 1;
+                HorizontalLayout {
+                    spacing: 14px;
+                    VerticalBox {
+                        padding: 0;
+                        spacing: 4px;
+                        horizontal-stretch: 1;
+                        Text {
+                            text: "Allows launching LiveCDs directly from your file manager right-click menu.";
+                            font-size: 12px;
+                            color: #d8dee9;
+                        }
+                        Text {
+                            text: "Current Status: " + root.integration-status;
+                            font-size: 11px;
+                            color: root.is-integrated ? #a3be8c : #d08770;
+                            font-weight: 600;
+                        }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: end;
+                        Button {
+                            text: "Install Association";
+                            enabled: !root.is-integrated;
+                            clicked => { root.install-integration(); }
+                        }
+                        Button {
+                            text: "Uninstall";
+                            enabled: root.is-integrated;
+                            clicked => { root.uninstall-integration(); }
+                        }
+                    }
+                }
+            }
+
+            Rectangle { vertical-stretch: 1; }
+
+            // Footer Bar
+            HorizontalLayout {
+                spacing: 12px;
                 Text {
                     text: "QEMU Path: " + root.qemu-path;
                     font-size: 11px;
                     color: #d8dee9;
                     overflow: elide;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
                 }
-            }
 
-            Button {
-                text: "Change QEMU...";
-                clicked => { root.browse-qemu(); }
-            }
+                Button {
+                    text: "Change QEMU...";
+                    clicked => { root.browse-qemu(); }
+                }
 
-            Button {
-                text: "Shortcuts (Help)";
-                clicked => { root.show-help = true; }
-            }
+                Button {
+                    text: "Shortcuts (Help)";
+                    clicked => { root.show-help = true; }
+                }
 
-            Button {
-                text: "About";
-                clicked => { root.show-about = true; }
+                Button {
+                    text: "About";
+                    clicked => { root.show-about = true; }
+                }
             }
         }
     }
