@@ -245,6 +245,8 @@ export component AppWindow inherits Window {
                             border-color: #bf616a;
                             height: 120px;
                             TextEdit {
+                                width: parent.width;
+                                height: parent.height;
                                 text: root.vm-error;
                                 read-only: true;
                                 font-size: 11px;
