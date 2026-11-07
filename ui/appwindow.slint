@@ -1,4 +1,4 @@
-import { Button, VerticalBox, HorizontalBox, LineEdit, Slider, ComboBox, CheckBox, ScrollView } from "std-widgets.slint";
+import { Button, VerticalBox, HorizontalBox, LineEdit, Slider, ComboBox, CheckBox, ScrollView, TextEdit } from "std-widgets.slint";
 
 component ModalDialog inherits Rectangle {
     in property <string> title: "";
@@ -123,6 +123,7 @@ export component AppWindow inherits Window {
     in-out property <string> qemu-path: "qemu-system-x86_64";
     in-out property <string> accel-info: "Detecting accelerator...";
     in-out property <string> vm-status: "Ready";
+    in-out property <string> vm-error: "";
     in-out property <bool> is-vm-running: false;
     in-out property <string> integration-status: "Not Installed";
     in-out property <bool> is-integrated: false;
@@ -222,7 +223,31 @@ export component AppWindow inherits Window {
                         text: "Status: " + root.vm-status;
                         font-size: 12px;
                         font-weight: 600;
-                        color: root.is-vm-running ? #a3be8c : #ebcb8b;
+                        color: root.is-vm-running ? #a3be8c : (root.vm-error != "" ? #bf616a : #ebcb8b);
+                    }
+                }
+
+                if root.vm-error != "": VerticalBox {
+                    padding: 0;
+                    spacing: 4px;
+                    Text {
+                        text: "QEMU error output:";
+                        font-size: 11px;
+                        font-weight: 600;
+                        color: #bf616a;
+                    }
+                    Rectangle {
+                        background: #2e3440;
+                        border-radius: 4px;
+                        border-width: 1px;
+                        border-color: #bf616a;
+                        height: 120px;
+                        TextEdit {
+                            text: root.vm-error;
+                            read-only: true;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
                     }
                 }
 

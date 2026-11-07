@@ -1,8 +1,10 @@
 use std::ffi::OsString;
+use std::collections::VecDeque;
 use std::fs::File;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 use which::which;
 
@@ -174,6 +176,153 @@ fn drive_format(ext: &str) -> &'static str {
     }
 }
 
+/// Maximum number of stderr lines kept for the UI.
+const TAIL_MAX_LINES: usize = 20;
+/// Maximum number of stderr bytes kept for the UI.
+const TAIL_MAX_BYTES: usize = 4096;
+/// Longest chunk read as a single "line" (guards against newline-free output).
+const MAX_LINE_READ: u64 = 16 * 1024;
+/// How long the waiter waits for the stderr reader to hit EOF after exit.
+const READER_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// How a VM process ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExitKind {
+    /// Exit code 0.
+    Success,
+    /// Non-zero exit code.
+    Failed(i32),
+    /// Killed by a signal (no exit code).
+    Signaled,
+    /// Waiting on the process failed.
+    WaitError(String),
+}
+
+/// Result handed to the `on_exit` callback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmExit {
+    pub kind: ExitKind,
+    /// Sanitized tail of QEMU's stderr (bounded; may be empty).
+    pub stderr_tail: String,
+}
+
+impl VmExit {
+    pub fn is_success(&self) -> bool {
+        self.kind == ExitKind::Success
+    }
+
+    /// One-line human summary, e.g. "QEMU failed (exit code 1)".
+    pub fn summary(&self) -> String {
+        match &self.kind {
+            ExitKind::Success => "Exited (code 0)".to_string(),
+            ExitKind::Failed(code) => format!("QEMU failed (exit code {})", code),
+            ExitKind::Signaled => "QEMU terminated by signal".to_string(),
+            ExitKind::WaitError(e) => format!("Error: process error: {}", e),
+        }
+    }
+}
+
+/// Bounded buffer of the most recent sanitized stderr lines.
+#[derive(Default)]
+struct StderrTail {
+    lines: VecDeque<String>,
+    bytes: usize,
+}
+
+impl StderrTail {
+    fn push(&mut self, mut line: String) {
+        if line.is_empty() {
+            return;
+        }
+        if line.len() > TAIL_MAX_BYTES {
+            let mut cut = line.len() - TAIL_MAX_BYTES;
+            while !line.is_char_boundary(cut) {
+                cut += 1;
+            }
+            line.drain(..cut);
+        }
+        self.bytes += line.len() + 1;
+        self.lines.push_back(line);
+        while self.lines.len() > TAIL_MAX_LINES
+            || (self.bytes > TAIL_MAX_BYTES && self.lines.len() > 1)
+        {
+            if let Some(old) = self.lines.pop_front() {
+                self.bytes -= old.len() + 1;
+            }
+        }
+    }
+
+    fn text(&self) -> String {
+        self.lines.iter().map(String::as_str).collect::<Vec<_>>().join("\n")
+    }
+}
+
+/// Removes ANSI escape sequences (CSI, OSC, other ESC pairs) and control
+/// characters (except tab) from `s`.
+fn sanitize(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => match chars.next() {
+                Some('[') => {
+                    // CSI: parameters/intermediates until a final byte 0x40..=0x7e.
+                    for n in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&n) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    // OSC: until BEL or ST (ESC \).
+                    while let Some(n) = chars.next() {
+                        if n == '\x07' {
+                            break;
+                        }
+                        if n == '\x1b' {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            '\t' => out.push(c),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Drains `stderr` on its own thread so the pipe never fills and blocks QEMU.
+/// Every line is echoed to our own stderr; a bounded sanitized tail is kept.
+/// Sends on `done` once EOF is reached.
+fn spawn_stderr_reader<R: Read + Send + 'static>(
+    stderr: R,
+    tail: Arc<Mutex<StderrTail>>,
+    done: mpsc::Sender<()>,
+) {
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            match reader.by_ref().take(MAX_LINE_READ).read_until(b'\n', &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let raw = String::from_utf8_lossy(&buf);
+                    let raw = raw.trim_end_matches(['\n', '\r']);
+                    eprintln!("{}", raw);
+                    let clean = sanitize(raw);
+                    tail.lock().unwrap_or_else(|e| e.into_inner()).push(clean);
+                }
+            }
+        }
+        let _ = done.send(());
+    });
+}
+
 pub struct VmRunner {
     active_process: Arc<Mutex<Option<Child>>>,
 }
@@ -207,7 +356,7 @@ impl VmRunner {
 
     pub fn launch<F>(&self, config: VmConfig, on_exit: F) -> Result<(), String>
     where
-        F: FnOnce(Result<i32, String>) + Send + 'static,
+        F: FnOnce(VmExit) + Send + 'static,
     {
         let mut lock = self.active_process.lock().unwrap();
         if lock.is_some() {
@@ -218,9 +367,15 @@ impl VmRunner {
         cmd.args(build_args(&config)?);
 
         cmd.stdout(Stdio::inherit())
-           .stderr(Stdio::inherit());
+           .stderr(Stdio::piped());
 
-        let child = cmd.spawn().map_err(|e| format!("Failed to spawn QEMU: {}", e))?;
+        let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn QEMU: {}", e))?;
+        let tail = Arc::new(Mutex::new(StderrTail::default()));
+        let (done_tx, done_rx) = mpsc::channel();
+        match child.stderr.take() {
+            Some(stderr) => spawn_stderr_reader(stderr, tail.clone(), done_tx),
+            None => drop(done_tx),
+        }
         let pid = child.id();
         let proc_handle = self.active_process.clone();
         *lock = Some(child);
@@ -236,14 +391,15 @@ impl VmRunner {
                             Ok(Some(status)) => {
                                 guard.take();
                                 break match status.code() {
-                                    Some(code) => Ok(code),
-                                    None => Err("Process terminated by signal".to_string()),
+                                    Some(0) => ExitKind::Success,
+                                    Some(code) => ExitKind::Failed(code),
+                                    None => ExitKind::Signaled,
                                 };
                             }
                             Ok(None) => {}
                             Err(e) => {
                                 guard.take();
-                                break Err(format!("Process error: {}", e));
+                                break ExitKind::WaitError(e.to_string());
                             }
                         },
                         _ => return,
@@ -251,7 +407,11 @@ impl VmRunner {
                 }
                 std::thread::sleep(Duration::from_millis(200));
             };
-            on_exit(result);
+            // Let the reader reach EOF so the tail is complete, but never hang
+            // if the pipe is held open (e.g. by an orphaned grandchild).
+            let _ = done_rx.recv_timeout(READER_JOIN_TIMEOUT);
+            let stderr_tail = tail.lock().unwrap_or_else(|e| e.into_inner()).text();
+            on_exit(VmExit { kind: result, stderr_tail });
         });
 
         Ok(())
@@ -271,7 +431,7 @@ mod tests {
 
     fn launch_script<F>(runner: &VmRunner, name: &str, body: &str, on_exit: F) -> Result<(), String>
     where
-        F: FnOnce(Result<i32, String>) + Send + 'static,
+        F: FnOnce(VmExit) + Send + 'static,
     {
         let _g = SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         runner.launch(cfg(script(name, body)), on_exit)
@@ -316,7 +476,7 @@ mod tests {
         let runner = VmRunner::new();
         let (tx, rx) = mpsc::channel();
         launch_script(&runner, "exit", "exit 3", move |r| tx.send(r).unwrap()).unwrap();
-        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), Ok(3));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap().kind, ExitKind::Failed(3));
         assert!(rx.recv_timeout(Duration::from_millis(500)).is_err());
         assert!(!runner.is_running());
     }
@@ -326,7 +486,77 @@ mod tests {
         let runner = VmRunner::new();
         let (tx, rx) = mpsc::channel();
         launch_script(&runner, "sig", "kill -9 $$", move |r| tx.send(r).unwrap()).unwrap();
-        assert!(rx.recv_timeout(Duration::from_secs(5)).unwrap().is_err());
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap().kind, ExitKind::Signaled);
+    }
+
+    fn run_script(name: &str, body: &str) -> VmExit {
+        let runner = VmRunner::new();
+        let (tx, rx) = mpsc::channel();
+        launch_script(&runner, name, body, move |r| tx.send(r).unwrap()).unwrap();
+        rx.recv_timeout(Duration::from_secs(10)).unwrap()
+    }
+
+    #[test]
+    fn stderr_is_captured_on_failure() {
+        let exit = run_script("boom", "echo 'boom: something failed' >&2; exit 1");
+        assert_eq!(exit.kind, ExitKind::Failed(1));
+        assert!(!exit.is_success());
+        assert!(exit.stderr_tail.contains("boom: something failed"), "{:?}", exit.stderr_tail);
+        assert_eq!(exit.summary(), "QEMU failed (exit code 1)");
+    }
+
+    #[test]
+    fn stderr_tail_is_bounded() {
+        let exit = run_script("many", "i=1; while [ $i -le 1000 ]; do echo \"line $i\" >&2; i=$((i+1)); done; exit 2");
+        assert_eq!(exit.kind, ExitKind::Failed(2));
+        assert!(exit.stderr_tail.contains("line 1000"));
+        assert!(!exit.stderr_tail.lines().any(|l| l == "line 1"));
+        assert!(exit.stderr_tail.lines().count() <= TAIL_MAX_LINES);
+        assert!(exit.stderr_tail.len() <= TAIL_MAX_BYTES);
+    }
+
+    #[test]
+    fn success_has_empty_tail() {
+        let exit = run_script("ok", "exit 0");
+        assert_eq!(exit, VmExit { kind: ExitKind::Success, stderr_tail: String::new() });
+        assert!(exit.is_success());
+    }
+
+    #[test]
+    fn stderr_is_sanitized() {
+        let exit = run_script("ansi", "printf '\\033[31mred\\033[0m \\033]0;title\\007ok\\r\\n' >&2; exit 1");
+        assert_eq!(exit.stderr_tail, "red ok");
+    }
+
+    #[test]
+    fn open_pipe_does_not_hang_on_exit() {
+        // A background child keeps stderr open after the main process exits.
+        let start = std::time::Instant::now();
+        let exit = run_script("held", "echo early >&2; (sleep 5 >/dev/null) & exit 1");
+        assert!(start.elapsed() < Duration::from_secs(4));
+        assert_eq!(exit.kind, ExitKind::Failed(1));
+        assert!(exit.stderr_tail.contains("early"));
+    }
+
+    /// Real-QEMU check; run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn real_qemu_missing_image_reports_error() {
+        let Some(home) = std::env::var_os("HOME") else { return };
+        let qemu = PathBuf::from(home).join(".local/bin/qemu-system-x86_64");
+        if !qemu.exists() {
+            eprintln!("skipping: {} not found", qemu.display());
+            return;
+        }
+        let runner = VmRunner::new();
+        let (tx, rx) = mpsc::channel();
+        let mut c = cfg(qemu);
+        c.iso_path = PathBuf::from("/nonexistent/definitely-missing.iso");
+        runner.launch(c, move |r| tx.send(r).unwrap()).unwrap();
+        let exit = rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        eprintln!("exit: {:?}", exit);
+        assert!(matches!(exit.kind, ExitKind::Failed(_)));
+        assert!(exit.stderr_tail.contains("Could not open"), "{:?}", exit.stderr_tail);
     }
 }
 

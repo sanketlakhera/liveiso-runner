@@ -156,6 +156,7 @@ fn main() -> Result<(), slint::PlatformError> {
             };
 
             ui.set_is_vm_running(true);
+            ui.set_vm_error("".into());
             ui.set_vm_status("Launching QEMU...".into());
 
             let ui_weak_exit = ui_handle.clone();
@@ -163,13 +164,14 @@ fn main() -> Result<(), slint::PlatformError> {
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(ui) = ui_weak_exit.upgrade() {
                         ui.set_is_vm_running(false);
-                        match result {
-                            Ok(code) => {
-                                ui.set_vm_status(format!("Exited (Code {})", code).into());
-                            }
-                            Err(err) => {
-                                ui.set_vm_status(format!("Error: {}", err).into());
-                            }
+                        ui.set_vm_status(result.summary().into());
+                        if !result.is_success() {
+                            let details = if result.stderr_tail.is_empty() {
+                                "(QEMU printed no error output)".to_string()
+                            } else {
+                                result.stderr_tail
+                            };
+                            ui.set_vm_error(details.into());
                         }
                     }
                 });
@@ -177,7 +179,8 @@ fn main() -> Result<(), slint::PlatformError> {
 
             if let Err(e) = launch_res {
                 ui.set_is_vm_running(false);
-                ui.set_vm_status(format!("Launch failed: {}", e).into());
+                ui.set_vm_status("Launch failed".into());
+                ui.set_vm_error(e.into());
             } else {
                 ui.set_vm_status("VM Active".into());
             }
